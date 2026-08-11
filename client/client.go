@@ -23,9 +23,13 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,12 +47,27 @@ var (
 	warmup    = flag.Int("warmup", 3, "seconds to send before starting measurement")
 	outPath   = flag.String("out", "", "write the JSON summary here as well as stdout")
 	targets   = flag.String("targets", "", "comma-separated http addresses to send to (default: every node in the config)")
+	// Not "transport": banyan's own transport package already registers a flag
+	// by that name (the node's socket scheme), and a duplicate makes the flag
+	// package panic at init before main runs.
+	clientTransport = flag.String("client-transport", "tcp", "how to reach the nodes: `tcp` (one pipelined connection per node) or `http` (one connection per outstanding request)")
 )
 
 type sample struct {
 	latency time.Duration
 	ok      bool
 }
+
+// Outcome of a request, for the counters.
+const (
+	outcomeOK = iota
+	outcomeFailed
+	outcomeTimedOut
+)
+
+// measuredPrefix marks request ids issued inside the measurement window, so a
+// reply arriving later can be attributed without a second map of ids.
+const measuredPrefix = "m"
 
 type summary struct {
 	Targets        []string  `json:"targets"`
@@ -87,15 +106,15 @@ func main() {
 	// One connection pool, sized to the in-flight cap so the client is never
 	// the queue: without raising these, Go's default of 2 idle conns per host
 	// serializes requests and the "rate" we report is the transport's, not
-	// the protocol's.
-	transport := &http.Transport{
+	// the protocol's. Only used by the http transport.
+	httpTransport := &http.Transport{
 		MaxIdleConns:        *inFlight * 2,
 		MaxIdleConnsPerHost: *inFlight,
 		MaxConnsPerHost:     0,
 		IdleConnTimeout:     90 * time.Second,
 	}
 	client := &http.Client{
-		Transport: transport,
+		Transport: httpTransport,
 		Timeout:   time.Duration(*timeoutMs) * time.Millisecond,
 	}
 
@@ -111,10 +130,75 @@ func main() {
 		timedOut  int64
 		mu        sync.Mutex
 		samples   []sample
-		wg        sync.WaitGroup
 	)
 
 	sem := make(chan struct{}, *inFlight)
+	timeout := time.Duration(*timeoutMs) * time.Millisecond
+
+	measureStart := time.Time{}
+	var measuredSent int64
+
+	// record is called once per request, from whichever path resolved it.
+	// It releases the in-flight slot, so a reply (or an expiry) is what admits
+	// the next request — that is the closed-loop part of the load model.
+	record := func(id string, latency time.Duration, outcome int) {
+		<-sem
+		switch outcome {
+		case outcomeOK:
+			atomic.AddInt64(&committed, 1)
+		case outcomeTimedOut:
+			atomic.AddInt64(&timedOut, 1)
+		default:
+			atomic.AddInt64(&failed, 1)
+		}
+		if strings.HasPrefix(id, measuredPrefix) {
+			mu.Lock()
+			samples = append(samples, sample{latency: latency, ok: outcome == outcomeOK})
+			mu.Unlock()
+		}
+	}
+
+	var conns []*pipelinedConn
+	if *clientTransport == "tcp" {
+		onReply := func(id string, latency time.Duration, ok bool) {
+			outcome := outcomeFailed
+			if ok {
+				outcome = outcomeOK
+			}
+			record(id, latency, outcome)
+		}
+		for _, addr := range addrs {
+			target, err := clientAddr(addr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "bad target %q: %v\n", addr, err)
+				os.Exit(1)
+			}
+			conn, err := dialPipelined(target, onReply)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "dial %s: %v\n", target, err)
+				os.Exit(1)
+			}
+			conns = append(conns, conn)
+		}
+		// Reclaim slots held by requests whose replies never arrive, so one
+		// lost reply cannot wedge the whole client behind the in-flight cap.
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				for _, c := range conns {
+					for i := 0; i < c.expire(timeout); i++ {
+						// expire() already reported each id through onReply as
+						// a failure; count them as timeouts instead.
+						atomic.AddInt64(&failed, -1)
+						atomic.AddInt64(&timedOut, 1)
+					}
+				}
+			}
+		}()
+	}
+
+	var wg sync.WaitGroup // http path only
 	stop := time.After(time.Duration(*warmup+*duration) * time.Second)
 	measureFrom := time.Now().Add(time.Duration(*warmup) * time.Second)
 
@@ -128,9 +212,6 @@ func main() {
 	}
 	next := time.Now()
 	seq := 0
-
-	measureStart := time.Time{}
-	var measuredSent int64
 
 loop:
 	for {
@@ -153,41 +234,74 @@ loop:
 		}
 
 		sem <- struct{}{}
-		wg.Add(1)
 		seq++
-		id := fmt.Sprintf("%d-%d", os.Getpid(), seq)
-		target := addrs[seq%len(addrs)]
 		measuring := !measureStart.IsZero()
+		id := fmt.Sprintf("%d-%d", os.Getpid(), seq)
+		if measuring {
+			id = measuredPrefix + id
+		}
+		idx := seq % len(addrs)
 
-		go func(id, target string, measuring bool) {
-			defer wg.Done()
-			defer func() { <-sem }()
+		atomic.AddInt64(&sent, 1)
+		if measuring {
+			atomic.AddInt64(&measuredSent, 1)
+		}
 
-			atomic.AddInt64(&sent, 1)
-			if measuring {
-				atomic.AddInt64(&measuredSent, 1)
+		if *clientTransport == "tcp" {
+			// The send itself does not block on the reply: the connection is
+			// pipelined and the reader goroutine resolves it later.
+			if err := conns[idx].send(id, payload); err != nil {
+				record(id, 0, outcomeFailed)
 			}
-			start := time.Now()
-			ok, timeout := send(client, target, id, payload)
-			elapsed := time.Since(start)
+			continue
+		}
 
+		wg.Add(1)
+		go func(id, target string) {
+			defer wg.Done()
+			start := time.Now()
+			ok, timedOutErr := send(client, target, id, payload)
+			outcome := outcomeFailed
 			switch {
 			case ok:
-				atomic.AddInt64(&committed, 1)
-			case timeout:
-				atomic.AddInt64(&timedOut, 1)
-			default:
-				atomic.AddInt64(&failed, 1)
+				outcome = outcomeOK
+			case timedOutErr:
+				outcome = outcomeTimedOut
 			}
-			if measuring {
-				mu.Lock()
-				samples = append(samples, sample{latency: elapsed, ok: ok})
-				mu.Unlock()
-			}
-		}(id, target, measuring)
+			record(id, time.Since(start), outcome)
+		}(id, addrs[idx])
 	}
 
-	wg.Wait()
+	if *clientTransport == "tcp" {
+		// Drain: wait for outstanding replies, bounded by the request timeout
+		// plus slack, then close. Without this the tail of the run — exactly
+		// the requests that queued longest — would be missing from the sample.
+		drainUntil := time.Now().Add(timeout + 5*time.Second)
+		for time.Now().Before(drainUntil) {
+			outstanding := 0
+			for _, c := range conns {
+				c.mu.Lock()
+				outstanding += len(c.pending)
+				c.mu.Unlock()
+			}
+			if outstanding == 0 {
+				break
+			}
+			for _, c := range conns {
+				for i := 0; i < c.expire(timeout); i++ {
+					atomic.AddInt64(&failed, -1)
+					atomic.AddInt64(&timedOut, 1)
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		for _, c := range conns {
+			c.close()
+		}
+	} else {
+		wg.Wait()
+	}
+
 	elapsed := time.Since(measureStart).Seconds()
 	if measureStart.IsZero() || elapsed <= 0 {
 		elapsed = float64(*duration)
@@ -196,6 +310,33 @@ loop:
 	report(addrs, samples, atomic.LoadInt64(&measuredSent), &sent, &committed,
 		&failed, &timedOut, elapsed)
 }
+
+// clientAddr maps an http endpoint to the node's pipelined client port.
+//
+// The harness passes http targets (that is what the config knows), and the
+// node derives every port from its 1-based index: http is 8069+i, the client
+// listener is 5000+i. So the offset between them is constant.
+func clientAddr(httpTarget string) (string, error) {
+	u, err := url.Parse(httpTarget)
+	if err != nil {
+		return "", err
+	}
+	httpPort, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return "", fmt.Errorf("no port in %q", httpTarget)
+	}
+	nodeIndex := httpPort - httpPortBase
+	if nodeIndex <= 0 {
+		return "", fmt.Errorf("port %d is not an http node port", httpPort)
+	}
+	return net.JoinHostPort(u.Hostname(), strconv.Itoa(clientPortBase+nodeIndex)), nil
+}
+
+// Must match config/config.go:Load and node.ClientPortBase.
+const (
+	httpPortBase   = 8069
+	clientPortBase = 5000
+)
 
 // send posts one request and waits for the commit reply. Returns (ok,
 // timedOut) so the caller can tell a saturated protocol from a broken one.

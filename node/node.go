@@ -84,6 +84,9 @@ func (n *node) Run() {
 		go n.handle()
 		go n.recv()
 		go n.txn()
+		// Pipelined client transport; the HTTP server below still serves
+		// /query and the one-request-per-connection /request endpoint.
+		go n.clientListener()
 	}
 	n.http()
 }

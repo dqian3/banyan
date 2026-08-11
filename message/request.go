@@ -9,6 +9,15 @@ import (
 func init() {
 	gob.Register(Request{})
 	gob.Register(RequestReply{})
+	gob.Register(ClientRequest{})
+}
+
+// ClientRequest is what a client puts on the wire over a pipelined
+// connection. It carries no reply channel and no timestamps: the reply is
+// matched by ID on the way back, and arrival is stamped by the node.
+type ClientRequest struct {
+	ID      string
+	Payload []byte
 }
 
 // Request is a client request awaiting inclusion in a block.
