@@ -71,7 +71,12 @@ type summary struct {
 func main() {
 	flag.Parse()
 	log.Setup()
-	config.Configuration.Load()
+	// Only read the node config when we have to discover targets from it.
+	// With -targets given, a client machine needs no config.json or ips.txt —
+	// which is what lets clients run on VMs that hold no replica state.
+	if *targets == "" {
+		config.Configuration.Load()
+	}
 
 	addrs := resolveTargets()
 	if len(addrs) == 0 {
