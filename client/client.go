@@ -207,6 +207,13 @@ func send(client *http.Client, target, id string, payload []byte) (bool, bool) {
 	}
 	req.Header.Set("Cid", id)
 	req.Header.Set("Content-Type", "application/octet-stream")
+	// Disable net/http's automatic replay. A *bytes.Reader body makes the
+	// request retryable, and the transport silently re-sends it when a
+	// connection dies before the response — which under load delivers the same
+	// request id to a node twice, inflating what the servers count as offered
+	// load above what this client actually sent. A load generator must send
+	// exactly what it reports.
+	req.GetBody = nil
 
 	resp, err := client.Do(req)
 	if err != nil {
