@@ -4,6 +4,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"math/rand"
+	"os"
 	"time"
 
 	"go.uber.org/atomic"
@@ -64,6 +65,11 @@ type Replica struct {
 	commitWait        *waitStats
 	committedRequests int
 }
+
+// WarmupHeights is how many heights the chain runs before the measurement
+// window opens, giving the committee time to reach steady state. The report
+// arrays are also dumped from this height on.
+const WarmupHeights = 3
 
 // NewReplica creates a new replica instance
 func NewReplica(id identity.NodeID, alg string, isByz bool) *Replica {
@@ -207,14 +213,44 @@ func (r *Replica) requestReport() string {
 	return response
 }
 
+// armSelfExit schedules the node to exit once the run is over, if the config
+// asked for it. See config.ExitAfter: a node that outlives its harness keeps
+// proposing forever and grows without bound, so a benchmark binary bounding
+// its own life is the difference between a crashed run costing nothing and it
+// quietly eating the machine.
+func (r *Replica) armSelfExit() {
+	after := config.GetConfig().ExitAfter
+	if after <= 0 {
+		return
+	}
+	grace := r.experimentDuration + time.Duration(after)*time.Second
+	time.AfterFunc(grace, func() {
+		log.Infof("[%v] experiment finished %v ago; exiting", r.ID(), grace)
+		os.Exit(0)
+	})
+}
+
 /* Processors */
 
 func (r *Replica) processCommittedBlock(block *blockchain.Block) {
-	if block.Height == 3 {
+	// Open the measurement window on the first commit at or past the warm-up
+	// height. Keying on height *exactly* 3 silently loses the whole run
+	// whenever that height is not observed as its own commit — a commit can
+	// cover several heights at once, and the fast path can carry the chain
+	// past 3 before this node processes it. When that happened,
+	// experimentStartTime stayed the zero value, whose window closed in year
+	// 1, so every subsequent block was treated as post-window: zero committed
+	// requests and zero recorded waits, while clients still got their replies.
+	if !r.experimentStarted && block.Height >= WarmupHeights {
 		r.experimentStartTime = time.Now()
 		r.experimentStarted = true
+		r.armSelfExit()
 	}
-	if r.experimentStartTime.Add(r.experimentDuration).Before(time.Now()) && (block.Height > 3) {
+	// The experimentStarted guard matters for the same reason: without it a
+	// zero start time makes this test true for everything.
+	if r.experimentStarted &&
+		r.experimentStartTime.Add(r.experimentDuration).Before(time.Now()) &&
+		(block.Height > WarmupHeights) {
 		// Past the measurement window: stop recording, but still answer the
 		// clients in this block. Leaving them unanswered would show up as a
 		// wave of timeouts in the client's tail latency at the end of every

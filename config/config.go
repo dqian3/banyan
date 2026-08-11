@@ -31,6 +31,17 @@ type Config struct {
 	// carry real client requests drained from the mempool and payload_size
 	// becomes a per-block byte budget. Empty means "generated".
 	Workload string `json:"workload"`
+	// ExitAfter, when > 0, is how many seconds past the end of the measurement
+	// window a node stays alive before exiting on its own.
+	//
+	// A banyan node never stops: with no clients it still proposes a block per
+	// consensus round, which on loopback is thousands a second, and its
+	// blockchain state grows with them. A node orphaned by a crashed harness
+	// therefore does not idle — it consumed 1.6 GB within four minutes during
+	// development, and four of them took most of a laptop's memory. This bound
+	// makes an orphan self-limiting; the harness still kills nodes normally,
+	// and sets this well past its own report collection.
+	ExitAfter int `json:"exit_after"`
 	// MemSize bounds the per-node request queue. Beyond it a node sheds new
 	// requests and tells the client, rather than absorbing unbounded backlog
 	// and reporting it as latency.
