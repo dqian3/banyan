@@ -58,7 +58,14 @@ func (f *LevelledForest) PruneUpToLevel(level uint64) ([]*Block, int, error) {
 	}
 	for l := level; l >= f.LowestLevel && l > 1; {
 		// assume each level has only one vertex
-		vertex := f.verticesAtLevel[l][0].vertex
+		// A level can legitimately be empty (no block was ever received for
+		// that height) or hold a placeholder with no block attached, so stop
+		// the walk instead of indexing into nothing.
+		verticesAtL := f.verticesAtLevel[l]
+		if len(verticesAtL) == 0 || verticesAtL[0].vertex == nil {
+			break
+		}
+		vertex := verticesAtL[0].vertex
 		parentID, _ := vertex.Parent()
 		parentVertex, ok := f.GetVertex(parentID)
 		if !ok || parentVertex.Level() < f.LowestLevel {
