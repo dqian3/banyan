@@ -34,6 +34,9 @@ type Banyan struct {
 	forkedBlocks     chan *blockchain.Block
 	rand             *rand.Rand
 	echoedBlock      map[crypto.Identifier]struct{}
+	// Highest height whose vote bookkeeping has been dropped; see
+	// forgetHeightsBelow.
+	forgottenHeight int
 }
 
 func NewBanyan(
@@ -65,6 +68,7 @@ func NewBanyan(
 	banyan.forkedBlocks = forkedBlocks
 	banyan.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	banyan.echoedBlock = make(map[crypto.Identifier]struct{}, 10000)
+	banyan.forgottenHeight = 1
 
 	return banyan
 }
@@ -138,11 +142,14 @@ func (banyan *Banyan) TryToShip(id crypto.Identifier) {
 				return
 			}
 			for _, cBlock := range committed {
+				banyan.forget(cBlock)
 				banyan.committedBlocks <- cBlock
 			}
 			for _, fBlock := range forked {
+				banyan.forget(fBlock)
 				banyan.forkedBlocks <- fBlock
 			}
+			banyan.forgetHeightsBelow(block.Height)
 
 			banyan.lastShippedBlock = id
 			delete(banyan.shipQueue, id)
@@ -231,6 +238,43 @@ func (banyan *Banyan) ProcessFinalizationShare(fs *blockchain.FinalizationShare)
 	// block is finalized!
 	banyan.isFinalized[fs.BlockID] = struct{}{}
 	banyan.TryToShip(fs.BlockID)
+}
+
+// forget drops the per-block bookkeeping for a block that has been committed
+// or forked. None of it is consulted again: the block is either settled in the
+// chain or discarded from the forest.
+//
+// Upstream never deletes from any of these maps, so a node accumulates an
+// entry per block for as long as it runs — and a banyan node runs forever,
+// proposing a block per consensus round whether or not there is anything to
+// order. On loopback that is thousands of blocks a second; four idle nodes
+// grew to 1.6 GB each within four minutes during development.
+func (banyan *Banyan) forget(block *blockchain.Block) {
+	if block == nil {
+		return
+	}
+	delete(banyan.isNotarized, block.ID)
+	delete(banyan.isFinalized, block.ID)
+	delete(banyan.echoedBlock, block.ID)
+	delete(banyan.shipQueue, block.ID)
+	banyan.NSharesBagBanyan.Forget(block.ID, block.Height)
+	banyan.fSharesBag.Forget(block.ID)
+}
+
+// forgetHeightsBelow drops the height-keyed vote bookkeeping for heights the
+// chain has already settled. Heights are dense, so this walks the gap since
+// the last sweep rather than scanning the maps, keeping the cost proportional
+// to progress instead of to history.
+func (banyan *Banyan) forgetHeightsBelow(height int) {
+	for h := banyan.forgottenHeight; h < height; h++ {
+		delete(banyan.sentNRank, h)
+		delete(banyan.sentNSharesNo, h)
+		delete(banyan.sentNShareId, h)
+		delete(banyan.sentFShare, h)
+	}
+	if height > banyan.forgottenHeight {
+		banyan.forgottenHeight = height
+	}
 }
 
 func (banyan *Banyan) MakeProposal(height int, rank int, payload []byte) *blockchain.Block {

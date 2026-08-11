@@ -121,6 +121,16 @@ func NewNSharesBagBanyan(n int, f int, p int) *NSharesBagBanyan {
 	}
 }
 
+// Forget drops the votes recorded for a block and the fast-path tally for its
+// height. Nothing consults either once the block is committed or forked, and
+// without this the bag keeps every notarization share of every block for the
+// life of the process — n signatures per block, which at loopback block rates
+// is the bulk of a node's growth.
+func (q *NSharesBagBanyan) Forget(blockID crypto.Identifier, height int) {
+	delete(q.votes, blockID)
+	delete(q.fastVotesRankZero, height)
+}
+
 // Add adds id to quorum ack records
 // return (is notarized, is fast path finalized)
 func (q *NSharesBagBanyan) Add(vote *NotarizationShare) (bool, bool) {

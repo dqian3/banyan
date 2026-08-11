@@ -54,6 +54,14 @@ func NewFSharesBag(total int) *FSharesBag {
 }
 
 // Add adds id to quorum ack records
+// Forget drops the finalization shares recorded for a block. Same reasoning as
+// NSharesBagBanyan.Forget: nothing reads them once the block is settled, and
+// upstream never deletes, so the bag holds n signatures for every block the
+// node has ever seen.
+func (q *FSharesBag) Forget(blockID crypto.Identifier) {
+	delete(q.votes, blockID)
+}
+
 func (q *FSharesBag) Add(vote *FinalizationShare) bool {
 	_, exist := q.votes[vote.BlockID]
 	if !exist {
