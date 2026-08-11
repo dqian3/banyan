@@ -48,3 +48,6 @@ bin/deploy/macos/server
 .log
 /package-lock.json
 /node_modules/
+
+# binaries built by the aspen-bft harness (scripts/benchmarks/banyan/build.py)
+/build/

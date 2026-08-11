@@ -3,6 +3,7 @@ package replica
 import (
 	"encoding/gob"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"go.uber.org/atomic"
@@ -13,6 +14,7 @@ import (
 	"banyan/identity"
 	"banyan/local_timeout"
 	"banyan/log"
+	"banyan/mempool"
 	"banyan/message"
 	"banyan/node"
 	"banyan/protocol"
@@ -46,6 +48,21 @@ type Replica struct {
 	committedBlockNo     int
 	lastHeightTime       time.Time
 	experimentStarted    bool
+
+	/* client workload (config.workload == "client") */
+
+	clientDriven bool
+	pool         *mempool.MemPool
+	pending      *pendingRequests
+	payloadRand  *rand.Rand
+	// proposeWait is the delay a request spends queued at the node that
+	// received it before some block includes it — the cost of waiting for
+	// this node's turn to propose. commitWait extends that to the moment the
+	// including block commits. Both are measured entirely on the receiving
+	// node, so neither carries cross-machine clock skew.
+	proposeWait       *waitStats
+	commitWait        *waitStats
+	committedRequests int
 }
 
 // NewReplica creates a new replica instance
@@ -64,6 +81,14 @@ func NewReplica(id identity.NodeID, alg string, isByz bool) *Replica {
 	r.experimentStarted = false
 
 	r.oneBlockPayloadBytes = config.GetConfig().PayloadSize
+	r.clientDriven = config.GetConfig().IsClientDriven()
+	r.pool = mempool.NewMemPool(config.GetConfig().MemSize)
+	r.pending = newPendingRequests()
+	// Seeded per node so two replicas don't generate identical payloads; the
+	// value is never consensus-relevant, only block filler.
+	r.payloadRand = rand.New(rand.NewSource(time.Now().UnixNano() + int64(id.Node())))
+	r.proposeWait = newWaitStats(5000, rand.New(rand.NewSource(1)))
+	r.commitWait = newWaitStats(5000, rand.New(rand.NewSource(2)))
 	r.isByz = isByz
 	r.strategy = config.GetConfig().Strategy
 	r.lt = local_timeout.NewLocalTimeout()
@@ -75,6 +100,7 @@ func NewReplica(id identity.NodeID, alg string, isByz bool) *Replica {
 	r.Register(blockchain.NotarizationShare{}, r.HandleNotarizationShare)
 	r.Register(blockchain.FinalizationShare{}, r.HandleFinalizationShare)
 	r.Register(message.Query{}, r.handleQuery)
+	r.Register(message.Request{}, r.handleRequest)
 	gob.Register(blockchain.Block{})
 	gob.Register(blockchain.NotarizationShare{})
 	gob.Register(blockchain.FinalizationShare{})
@@ -124,21 +150,61 @@ func (r *Replica) handleQuery(m message.Query) {
 	response += strconv.Itoa(r.committedBlockNo) + "\n"
 
 	response += "allBlockLatency\n"
-	for i := 3; i <= r.committedBlockNo; i++ {
+	for i := 3; i <= r.committedBlockNo && i < len(r.allBlockLatency); i++ {
 		response += strconv.Itoa(int(r.allBlockLatency[i].Milliseconds())) + ","
 	}
 
 	response += "\nproposerLatency\n"
-	for i := 3; i <= r.committedBlockNo; i++ {
+	for i := 3; i <= r.committedBlockNo && i < len(r.allBlockLatency); i++ {
 		response += strconv.Itoa(int(r.myBlockLatency[i].Milliseconds())) + ","
 	}
 
 	response += "\nblockTime\n"
-	for i := 3; i <= r.committedBlockNo; i++ {
+	for i := 3; i <= r.committedBlockNo && i < len(r.allBlockLatency); i++ {
 		response += strconv.Itoa(int(r.allBlockTimes[i].Milliseconds())) + ","
 	}
 
+	if r.clientDriven {
+		response += "\n" + r.requestReport()
+	}
+
 	m.Reply(message.QueryReply{Info: response})
+}
+
+// inMeasurementWindow reports whether the experiment clock is running, so
+// request stats cover the same interval as the block stats.
+func (r *Replica) inMeasurementWindow() bool {
+	return r.experimentStarted &&
+		!r.experimentStartTime.Add(r.experimentDuration).Before(time.Now())
+}
+
+// requestReport appends the client-workload sections of the /query dump.
+//
+// Waits are summarized rather than dumped per request: a run can commit
+// millions, so the report carries count/mean/max plus a bounded reservoir
+// sample the harness turns into percentiles.
+func (r *Replica) requestReport() string {
+	received, dropped := r.pool.Stats()
+
+	section := func(name string, w *waitStats) string {
+		out := name + "Count\n" + strconv.FormatInt(w.count, 10) + "\n"
+		out += name + "MeanMs\n" + strconv.FormatFloat(w.meanMs(), 'f', 3, 64) + "\n"
+		out += name + "MaxMs\n" + strconv.FormatInt(w.maxMs, 10) + "\n"
+		out += name + "SampleMs\n"
+		for _, v := range w.sample {
+			out += strconv.FormatInt(v, 10) + ","
+		}
+		return out + "\n"
+	}
+
+	response := "committedRequests\n" + strconv.Itoa(r.committedRequests) + "\n"
+	response += "requestsReceived\n" + strconv.FormatInt(received, 10) + "\n"
+	response += "requestsDropped\n" + strconv.FormatInt(dropped, 10) + "\n"
+	response += "requestsPending\n" + strconv.Itoa(r.pending.size()) + "\n"
+	response += "mempoolDepth\n" + strconv.Itoa(r.pool.Size()) + "\n"
+	response += section("proposeWait", r.proposeWait)
+	response += section("commitWait", r.commitWait)
+	return response
 }
 
 /* Processors */
@@ -149,20 +215,30 @@ func (r *Replica) processCommittedBlock(block *blockchain.Block) {
 		r.experimentStarted = true
 	}
 	if r.experimentStartTime.Add(r.experimentDuration).Before(time.Now()) && (block.Height > 3) {
+		// Past the measurement window: stop recording, but still answer the
+		// clients in this block. Leaving them unanswered would show up as a
+		// wave of timeouts in the client's tail latency at the end of every
+		// run.
+		if r.clientDriven {
+			r.answerCommitted(block.Payload)
+		}
 		return
 	}
 
 	proposeTime := block.Timestamp
 	if block.Height > 1 {
-		r.allBlockTimes[block.Height] = proposeTime.Sub(r.lastBlockProposeTime)
+		r.allBlockTimes = setDuration(r.allBlockTimes, block.Height, proposeTime.Sub(r.lastBlockProposeTime))
 	}
 	now := time.Now()
-	r.allBlockLatency[block.Height] = now.Sub(proposeTime)
+	r.allBlockLatency = setDuration(r.allBlockLatency, block.Height, now.Sub(proposeTime))
 	if block.Proposer == r.ID() {
-		r.myBlockLatency[block.Height] = r.allBlockLatency[block.Height]
+		r.myBlockLatency = setDuration(r.myBlockLatency, block.Height, r.allBlockLatency[block.Height])
 	}
 	r.committedBlockNo++
 	r.lastBlockProposeTime = proposeTime
+	if r.clientDriven {
+		r.committedRequests += r.answerCommitted(block.Payload)
+	}
 
 	log.Infof("[%v] the block is committed, height: %v, id: %x", r.ID(), block.Height, block.ID)
 }
@@ -179,7 +255,7 @@ func (r *Replica) proposeIfLeader(height int, rank int) {
 }
 
 func (r *Replica) proposeBlock(height int, rank int) {
-	block := r.Safety.MakeProposal(height, rank, r.oneBlockPayloadBytes)
+	block := r.Safety.MakeProposal(height, rank, r.buildPayload())
 	block.Timestamp = time.Now()
 	r.Broadcast(block)
 	_ = r.Safety.ProcessBlock(block)

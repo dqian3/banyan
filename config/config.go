@@ -25,9 +25,19 @@ type Config struct {
 	ByzNo              int    `json:"byzNo"`
 	Strategy           string `json:"strategy"`
 	PayloadSize        int    `json:"payload_size"`
-	F                  int    `json:"f"`
-	P                  int    `json:"p"`
-	N                  int    // total number of nodes
+	// Workload selects where block payload comes from: "generated" (the
+	// fork's default — each leader fills a block with random bytes, so
+	// offered load is set by payload_size alone) or "client", where blocks
+	// carry real client requests drained from the mempool and payload_size
+	// becomes a per-block byte budget. Empty means "generated".
+	Workload string `json:"workload"`
+	// MemSize bounds the per-node request queue. Beyond it a node sheds new
+	// requests and tells the client, rather than absorbing unbounded backlog
+	// and reporting it as latency.
+	MemSize int `json:"mem_size"`
+	F       int `json:"f"`
+	P       int `json:"p"`
+	N       int // total number of nodes
 
 	hasher string
 	signer string
@@ -43,9 +53,20 @@ func init() {
 	Configuration = MakeDefaultConfig()
 }
 
+// Workload modes for Config.Workload.
+const (
+	WorkloadGenerated = "generated"
+	WorkloadClient    = "client"
+)
+
 // GetConfig returns paxi package configuration
 func GetConfig() Config {
 	return Configuration
+}
+
+// IsClientDriven reports whether blocks should carry client requests.
+func (c Config) IsClientDriven() bool {
+	return c.Workload == WorkloadClient
 }
 
 // Simulation enable go channel transportation to simulate distributed environment
@@ -57,8 +78,9 @@ func Simulation() {
 // only used by init() and master
 func MakeDefaultConfig() Config {
 	return Config{
-		hasher: "sha3_256",
-		signer: "ECDSA_P256",
+		hasher:  "sha3_256",
+		signer:  "ECDSA_P256",
+		MemSize: 100000,
 	}
 }
 
@@ -152,6 +174,13 @@ func (c *Config) Load() {
 	}
 
 	c.N = len(c.Addrs)
+
+	if c.MemSize <= 0 {
+		c.MemSize = 100000
+	}
+	if c.Workload == "" {
+		c.Workload = WorkloadGenerated
+	}
 }
 
 // Save saves configuration to file in JSON format

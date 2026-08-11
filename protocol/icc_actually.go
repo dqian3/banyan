@@ -213,8 +213,8 @@ func (icc *Icc) ProcessFinalizationShare(fs *blockchain.FinalizationShare) {
 	icc.TryToShip(fs.BlockID)
 }
 
-func (icc *Icc) MakeProposal(height int, rank int, payloadSize int) *blockchain.Block {
+func (icc *Icc) MakeProposal(height int, rank int, payload []byte) *blockchain.Block {
 	prevID := icc.headId
-	block := blockchain.MakeBlock(height, rank, prevID, icc.ID(), payloadSize, icc.rand)
+	block := blockchain.MakeBlockWithPayload(height, rank, prevID, icc.ID(), payload)
 	return block
 }

@@ -233,8 +233,8 @@ func (banyan *Banyan) ProcessFinalizationShare(fs *blockchain.FinalizationShare)
 	banyan.TryToShip(fs.BlockID)
 }
 
-func (banyan *Banyan) MakeProposal(height int, rank int, payloadSize int) *blockchain.Block {
+func (banyan *Banyan) MakeProposal(height int, rank int, payload []byte) *blockchain.Block {
 	prevID := banyan.headId
-	block := blockchain.MakeBlock(height, rank, prevID, banyan.ID(), payloadSize, banyan.rand)
+	block := blockchain.MakeBlockWithPayload(height, rank, prevID, banyan.ID(), payload)
 	return block
 }

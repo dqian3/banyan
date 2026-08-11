@@ -30,13 +30,22 @@ type rawBlock struct {
 	ID          crypto.Identifier
 }
 
-// MakeBlock creates an unsigned block
+// MakeBlock creates an unsigned block carrying `blockByteSize` random bytes.
+// This is the generated workload: no clients, load set by block size alone.
 func MakeBlock(height int, rank int, prevID crypto.Identifier, proposer identity.NodeID, blockByteSize int, r *rand.Rand) *Block {
+	return MakeBlockWithPayload(height, rank, prevID, proposer, generateRandomPayload(blockByteSize, r))
+}
+
+// MakeBlockWithPayload creates an unsigned block over a caller-supplied
+// payload — client requests drained from the mempool, in the client workload.
+// The payload stays opaque bytes either way, so block hashing, the gob wire
+// format and every protocol's handling are identical in both modes.
+func MakeBlockWithPayload(height int, rank int, prevID crypto.Identifier, proposer identity.NodeID, payload []byte) *Block {
 	b := new(Block)
 	b.Height = height
 	b.Rank = rank
 	b.Proposer = proposer
-	b.Payload = generateRandomPayload(blockByteSize, r)
+	b.Payload = payload
 	b.PrevID = prevID
 	b.makeID(proposer)
 	return b
