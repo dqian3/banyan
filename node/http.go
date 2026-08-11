@@ -6,6 +6,7 @@ import (
 	"banyan/message"
 	"io"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 )
 
@@ -20,6 +21,12 @@ func (n *node) http() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/query", n.handleQuery)
 	mux.HandleFunc("/request", n.handleRequest)
+	// pprof on the node's own mux (importing net/http/pprof only registers on
+	// DefaultServeMux, which this server does not use). Index serves the
+	// sub-paths, so /debug/pprof/heap works. This is a benchmark binary whose
+	// memory behaviour is itself under investigation — being able to ask a
+	// running node where its heap went is worth a route.
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
 
 	// http string should be in form of ":8080"
 	ip, err := url.Parse(config.Configuration.HTTPAddrs[n.id])
