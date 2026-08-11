@@ -135,17 +135,17 @@ func (r *ReplicaView) handleQuery(m message.Query) {
 	response += strconv.Itoa(r.committedBlockNo) + "\n"
 
 	response += "allBlockLatency\n"
-	for i := 3; i <= r.committedBlockNo; i++ {
+	for i := 3; i <= r.committedBlockNo && i < len(r.allBlockLatency); i++ {
 		response += strconv.Itoa(int(r.allBlockLatency[i].Milliseconds())) + ","
 	}
 
 	response += "\nproposerLatency\n"
-	for i := 3; i <= r.committedBlockNo; i++ {
+	for i := 3; i <= r.committedBlockNo && i < len(r.allBlockLatency); i++ {
 		response += strconv.Itoa(int(r.myBlockLatency[i].Milliseconds())) + ","
 	}
 
 	response += "\nblockTime\n"
-	for i := 3; i <= r.committedBlockNo; i++ {
+	for i := 3; i <= r.committedBlockNo && i < len(r.allBlockLatency); i++ {
 		response += strconv.Itoa(int(r.allBlockTimes[i].Milliseconds())) + ","
 	}
 
@@ -167,12 +167,12 @@ func (r *ReplicaView) processCommittedBlock(block *blockchain.Block) {
 
 	proposeTime := block.Timestamp
 	if blockNum > 1 {
-		r.allBlockTimes[blockNum] = proposeTime.Sub(r.lastBlockProposeTime)
+		r.allBlockTimes = setDuration(r.allBlockTimes, blockNum, proposeTime.Sub(r.lastBlockProposeTime))
 	}
 	now := time.Now()
-	r.allBlockLatency[blockNum] = now.Sub(proposeTime)
+	r.allBlockLatency = setDuration(r.allBlockLatency, blockNum, now.Sub(proposeTime))
 	if block.Proposer == r.ID() {
-		r.myBlockLatency[blockNum] = r.allBlockLatency[blockNum]
+		r.myBlockLatency = setDuration(r.myBlockLatency, blockNum, r.allBlockLatency[blockNum])
 	}
 
 	r.lastBlockProposeTime = proposeTime

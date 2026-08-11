@@ -95,7 +95,17 @@ func (n *node) txn() {
 		name := v.Type().String()
 		f, exists := n.handles[name]
 		if !exists {
-			log.Fatalf("no registered handle function for message type %v", name)
+			// Log and drop rather than exit: this channel carries messages
+			// that arrive from outside (client requests over HTTP), and a
+			// protocol that does not register a handler for one of them must
+			// not be killable by sending it. Naming what *is* registered
+			// turns "the node died" into an obvious wiring diagnosis.
+			registered := make([]string, 0, len(n.handles))
+			for k := range n.handles {
+				registered = append(registered, k)
+			}
+			log.Errorf("no registered handle function for message type %v (registered: %v)", name, registered)
+			continue
 		}
 		f.Call([]reflect.Value{v})
 	}
