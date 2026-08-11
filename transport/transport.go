@@ -156,8 +156,12 @@ func (t *tcp) Listen() {
 						var m interface{}
 						err := decoder.Decode(&m)
 						if err != nil {
+							// A peer closing its side (EOF at shutdown) or a
+							// single malformed frame must not take this node
+							// down with it: drop the connection and keep
+							// serving the others.
 							log.Error(err)
-							panic("panic many bad!")
+							return
 						}
 						t.recv <- m
 					}
