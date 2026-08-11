@@ -185,12 +185,25 @@ func (r *Replica) proposeBlock(height int, rank int) {
 	_ = r.Safety.ProcessBlock(block)
 }
 
+// proposeRequest asks the event loop to propose, if this node is the leader
+// for (height, rank). ListenLocalEvent runs on its own goroutine and must not
+// touch Safety directly: the protocol state machine is not concurrency-safe,
+// and a self-proposal racing an inbound block corrupts the blockchain's maps
+// ("fatal error: concurrent map read and map write" in Banyan.ProcessBlock).
+// Routing the request through eventChan keeps every Safety call on the single
+// event-loop goroutine, which is how ReplicaView (hotstuff/streamlet) already
+// handles new views.
+type proposeRequest struct {
+	height int
+	rank   int
+}
+
 // ListenLocalEvent listens new height and timeout events
 func (r *Replica) ListenLocalEvent() {
 	block_production_height := 1
 	block_production_rank := 0
 	<-r.start
-	r.proposeIfLeader(block_production_height, block_production_rank)
+	r.eventChan <- proposeRequest{block_production_height, block_production_rank}
 	r.lastHeightTime = time.Now()
 	r.timer = time.NewTimer(r.lt.GetTimeoutDuration())
 	for {
@@ -201,7 +214,7 @@ func (r *Replica) ListenLocalEvent() {
 			case new_height := <-r.lt.GetNewHeight():
 				block_production_height = new_height
 				block_production_rank = 0
-				r.proposeIfLeader(block_production_height, block_production_rank)
+				r.eventChan <- proposeRequest{block_production_height, block_production_rank}
 				// measure round time
 				now := time.Now()
 				lasts := now.Sub(r.lastHeightTime)
@@ -210,7 +223,7 @@ func (r *Replica) ListenLocalEvent() {
 				break L
 			case <-r.timer.C:
 				block_production_rank += 1
-				r.proposeIfLeader(block_production_height, block_production_rank)
+				r.eventChan <- proposeRequest{block_production_height, block_production_rank}
 				break L
 			}
 		}
@@ -247,6 +260,8 @@ func (r *Replica) Start() {
 		event := <-r.eventChan
 		r.startSignal()
 		switch v := event.(type) {
+		case proposeRequest:
+			r.proposeIfLeader(v.height, v.rank)
 		case blockchain.Block:
 			r.Safety.ProcessBlock(&v)
 		case blockchain.NotarizationShare:
