@@ -23,6 +23,9 @@ const (
 	BLS_BLS12381    = "BLS_BLS12381"
 	ECDSA_P256      = "ECDSA_P256"
 	ECDSA_SECp256k1 = "ECDSA_SECp256k1"
+	// NONE signs nothing and verifies everything -- benchmarking only, so the
+	// signature cost can be measured by its absence. See none.go.
+	NONE = "NONE"
 )
 
 var keys []PrivateKey
@@ -90,6 +93,8 @@ func GenerateKey(signer string, id identity.NodeID) (PrivateKey, error) {
 		return nil, nil
 	} else if signer == BLS_BLS12381 {
 		return nil, nil
+	} else if signer == NONE {
+		return &none_PrivateKey{SignAlg: signer}, nil
 	} else {
 		return nil, errors.New("Invalid signature scheme!")
 	}
