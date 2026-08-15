@@ -38,8 +38,13 @@ func (n *node) clientListener() {
 	port := ClientPort(n.id)
 	listener, err := net.Listen("tcp", ":"+strconv.Itoa(port))
 	if err != nil {
-		log.Errorf("client listener on :%d failed: %v", port, err)
-		return
+		// Fatal, not a logged return. A node that keeps running without this
+		// listener still joins consensus and still commits blocks, so it
+		// reports a healthy-looking /query while every client request to it
+		// fails -- a run whose real cause is a stale process holding the port
+		// is then indistinguishable from the protocol collapsing under load.
+		// Dying here makes the harness's own "node exited" path report it.
+		log.Fatalf("client listener on :%d failed: %v", port, err)
 	}
 	log.Info("client listener starting on :", port)
 	for {

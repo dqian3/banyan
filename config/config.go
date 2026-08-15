@@ -50,8 +50,14 @@ type Config struct {
 	P       int `json:"p"`
 	N       int // total number of nodes
 
-	hasher string
-	signer string
+	// Exported, and tagged, because encoding/json silently skips unexported
+	// fields: while these were `hasher`/`signer` the decoder in Load() left
+	// them at their MakeDefaultConfig values, so every run signed with
+	// ECDSA_P256 no matter what config.json asked for -- including the runs
+	// the harness launched with `signer: "NONE"` to measure the cost of
+	// signing by its absence.
+	Hasher string `json:"hasher"`
+	Signer string `json:"signer"`
 }
 
 //var keys []crypto.PrivateKey
@@ -89,8 +95,8 @@ func Simulation() {
 // only used by init() and master
 func MakeDefaultConfig() Config {
 	return Config{
-		hasher:  "sha3_256",
-		signer:  "ECDSA_P256",
+		Hasher:  "sha3_256",
+		Signer:  "ECDSA_P256",
 		MemSize: 100000,
 	}
 }
@@ -124,11 +130,11 @@ func (c Config) IDs() []identity.NodeID {
 
 // GetHash returns the hashing scheme of the configuration
 func (c Config) GetHashScheme() string {
-	return c.hasher
+	return c.Hasher
 }
 
 func (c Config) GetSignatureScheme() string {
-	return c.signer
+	return c.Signer
 }
 
 // GetSignatureScheme returns the signing scheme of the configuration

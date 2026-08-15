@@ -152,6 +152,14 @@ func (r *Replica) handleQuery(m message.Query) {
 	response := "blockPayloadSize\n"
 	response += strconv.Itoa(r.oneBlockPayloadBytes) + "\n"
 
+	// How long the counters below were actually accumulating. Under the client
+	// workload this is the clients' warm-up *plus* their send window, so it is
+	// not `bench.duration` and dividing the committed counts by that overstates
+	// throughput by warmup/duration. Report it rather than making the harness
+	// re-derive it from two config keys that have drifted apart before.
+	response += "measurementWindowMs\n"
+	response += strconv.FormatInt(r.experimentDuration.Milliseconds(), 10) + "\n"
+
 	response += "committedBlocks\n"
 	response += strconv.Itoa(r.committedBlockNo) + "\n"
 

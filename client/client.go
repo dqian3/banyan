@@ -70,16 +70,27 @@ const (
 const measuredPrefix = "m"
 
 type summary struct {
-	Targets        []string  `json:"targets"`
-	Rate           float64   `json:"target_rate"`
-	Size           int       `json:"size"`
-	DurationS      float64   `json:"duration_s"`
-	Sent           int64     `json:"sent"`
-	Committed      int64     `json:"committed"`
-	Failed         int64     `json:"failed"`
-	TimedOut       int64     `json:"timed_out"`
-	OfferedRate    float64   `json:"offered_rate"`
-	DeliveredRate  float64   `json:"delivered_rate"`
+	Targets       []string `json:"targets"`
+	Rate          float64  `json:"target_rate"`
+	Size          int      `json:"size"`
+	DurationS     float64  `json:"duration_s"`
+	Sent          int64    `json:"sent"`
+	Committed     int64    `json:"committed"`
+	Failed        int64    `json:"failed"`
+	TimedOut      int64    `json:"timed_out"`
+	OfferedRate   float64  `json:"offered_rate"`
+	DeliveredRate float64  `json:"delivered_rate"`
+	// The rate the pacer was scheduled to emit at. Compare against
+	// OfferedRate to see whether the generator kept schedule at all.
+	ProducedRate float64 `json:"produced_rate"`
+	// Wall-clock fraction of the measurement window the send loop spent
+	// blocked waiting for an in-flight slot to free up. The load model is
+	// closed-loop -- a reply admits the next request -- so once this is
+	// nonzero the offered rate is set by MaxInFlight/latency and the run is
+	// measuring the client, not the protocol. Named to match the aspen
+	// sweep's column so rate_search's client-is-the-limit guard reads it.
+	CapWaitFrac    float64   `json:"cap_wait_frac"`
+	MaxInFlight    int       `json:"max_in_flight"`
 	LatencyMeanMs  float64   `json:"latency_ms_mean"`
 	LatencyP50Ms   float64   `json:"latency_ms_p50"`
 	LatencyP90Ms   float64   `json:"latency_ms_p90"`
@@ -137,6 +148,10 @@ func main() {
 
 	measureStart := time.Time{}
 	var measuredSent int64
+	// Time the send loop spent blocked on the in-flight semaphore inside the
+	// measurement window. Accumulated only while measuring, so it divides by
+	// the same elapsed the rates do.
+	var capWait time.Duration
 
 	// record is called once per request, from whichever path resolved it.
 	// It releases the in-flight slot, so a reply (or an expiry) is what admits
@@ -233,9 +248,19 @@ loop:
 			measuredSent = 0
 		}
 
-		sem <- struct{}{}
-		seq++
 		measuring := !measureStart.IsZero()
+		// Time the acquire rather than sampling the queue depth: blocking here
+		// is exactly the event that turns the offered rate into a function of
+		// the in-flight cap, and the accumulated total says how much of the
+		// window was spent that way.
+		if measuring {
+			blocked := time.Now()
+			sem <- struct{}{}
+			capWait += time.Since(blocked)
+		} else {
+			sem <- struct{}{}
+		}
+		seq++
 		id := fmt.Sprintf("%d-%d", os.Getpid(), seq)
 		if measuring {
 			id = measuredPrefix + id
@@ -308,7 +333,7 @@ loop:
 	}
 
 	report(addrs, samples, atomic.LoadInt64(&measuredSent), &sent, &committed,
-		&failed, &timedOut, elapsed)
+		&failed, &timedOut, elapsed, capWait)
 }
 
 // clientAddr maps an http endpoint to the node's pipelined client port.
@@ -398,7 +423,8 @@ func splitComma(s string) []string {
 }
 
 func report(addrs []string, samples []sample, measuredSent int64,
-	sent, committed, failed, timedOut *int64, elapsed float64) {
+	sent, committed, failed, timedOut *int64, elapsed float64,
+	capWait time.Duration) {
 
 	lat := make([]float64, 0, len(samples))
 	var okCount int64
@@ -441,6 +467,9 @@ func report(addrs []string, samples []sample, measuredSent int64,
 		TimedOut:      atomic.LoadInt64(timedOut),
 		OfferedRate:   float64(measuredSent) / elapsed,
 		DeliveredRate: float64(okCount) / elapsed,
+		ProducedRate:  *rate,
+		CapWaitFrac:   capWait.Seconds() / elapsed,
+		MaxInFlight:   *inFlight,
 		LatencyMeanMs: mean,
 		LatencyP50Ms:  pct(0.50),
 		LatencyP90Ms:  pct(0.90),
