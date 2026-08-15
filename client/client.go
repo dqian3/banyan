@@ -18,6 +18,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	"banyan/config"
+	"banyan/crypto"
 	"banyan/log"
 )
 
@@ -51,6 +53,14 @@ var (
 	// by that name (the node's socket scheme), and a duplicate makes the flag
 	// package panic at init before main runs.
 	clientTransport = flag.String("client-transport", "tcp", "how to reach the nodes: `tcp` (one pipelined connection per node) or `http` (one connection per outstanding request)")
+	// Identity this process signs under. Distinct per client process so the
+	// nodes are verifying against more than one key, as they would be with
+	// real clients.
+	clientID = flag.Uint("client-id", 1, "identity this client signs requests under")
+	// Must match the nodes' `signer`. The client is given targets on the
+	// command line and so never reads config.json, which is where the nodes
+	// get theirs; a mismatch shows up as every request failing verification.
+	signer = flag.String("signer", "ECDSA_P256", "signing scheme for client requests: ED25519, ECDSA_P256, or NONE")
 )
 
 type sample struct {
@@ -132,6 +142,15 @@ func main() {
 	payload := make([]byte, *size)
 	if _, err := rand.New(rand.NewSource(time.Now().UnixNano())).Read(payload); err != nil {
 		panic(err)
+	}
+
+	// Warm the key cache before the clock starts, so the first request does not
+	// pay for a key derivation.
+	cid := uint32(*clientID)
+	crypto.SetClientScheme(*signer)
+	if _, err := crypto.ClientPrivateKey(cid); err != nil {
+		fmt.Fprintf(os.Stderr, "client key for id %d (%s): %v\n", cid, *signer, err)
+		os.Exit(1)
 	}
 
 	var (
@@ -272,10 +291,22 @@ loop:
 			atomic.AddInt64(&measuredSent, 1)
 		}
 
+		// Signed here rather than once up front: the signature covers the
+		// request id, so a client cannot sign a single payload and replay it.
+		// This is the per-request signing cost aspen's and PBFT's clients pay,
+		// and it is on the offered-load path -- a client that cannot sign fast
+		// enough cannot offer load, which `cap_wait_frac` and `produced_rate`
+		// against `offered_rate` will show.
+		sig, err := crypto.SignRequest(cid, id, payload)
+		if err != nil {
+			record(id, 0, outcomeFailed)
+			continue
+		}
+
 		if *clientTransport == "tcp" {
 			// The send itself does not block on the reply: the connection is
 			// pipelined and the reader goroutine resolves it later.
-			if err := conns[idx].send(id, payload); err != nil {
+			if err := conns[idx].send(id, payload, cid, sig); err != nil {
 				record(id, 0, outcomeFailed)
 			}
 			continue
@@ -285,7 +316,7 @@ loop:
 		go func(id, target string) {
 			defer wg.Done()
 			start := time.Now()
-			ok, timedOutErr := send(client, target, id, payload)
+			ok, timedOutErr := send(client, target, id, payload, cid, sig)
 			outcome := outcomeFailed
 			switch {
 			case ok:
@@ -365,13 +396,18 @@ const (
 
 // send posts one request and waits for the commit reply. Returns (ok,
 // timedOut) so the caller can tell a saturated protocol from a broken one.
-func send(client *http.Client, target, id string, payload []byte) (bool, bool) {
+func send(client *http.Client, target, id string, payload []byte,
+	clientID uint32, sig crypto.Signature) (bool, bool) {
 	req, err := http.NewRequestWithContext(
 		context.Background(), http.MethodPost, target+"/request", bytes.NewReader(payload))
 	if err != nil {
 		return false, false
 	}
 	req.Header.Set("Cid", id)
+	req.Header.Set("Id", strconv.FormatUint(uint64(clientID), 10))
+	if len(sig) == 1 {
+		req.Header.Set("Sig", base64.StdEncoding.EncodeToString(sig[0]))
+	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	// Disable net/http's automatic replay. A *bytes.Reader body makes the
 	// request retryable, and the transport silently re-sends it when a

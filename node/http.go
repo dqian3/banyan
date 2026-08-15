@@ -2,18 +2,24 @@ package node
 
 import (
 	"banyan/config"
+	"banyan/crypto"
 	"banyan/log"
 	"banyan/message"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/pprof"
 	"net/url"
+	"strconv"
 )
 
 // http request header names
 const (
 	HTTPClientID  = "Id"
 	HTTPCommandID = "Cid"
+	// Base64 of the client's signature over crypto.SignedRequestBytes. A
+	// header because this transport puts the payload in the body.
+	HTTPRequestSig = "Sig"
 )
 
 // serve serves the http REST API request from clients
@@ -64,9 +70,21 @@ func (n *node) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The debug/probe transport carries what the pipelined one carries in the
+	// gob struct, so both paths present an authenticated request and the
+	// mempool never has to care which one it came in on.
+	clientID64, _ := strconv.ParseUint(r.Header.Get(HTTPClientID), 10, 32)
+	sigBytes, _ := base64.StdEncoding.DecodeString(r.Header.Get(HTTPRequestSig))
+	var sig crypto.Signature
+	if len(sigBytes) > 0 {
+		sig = crypto.Signature{sigBytes}
+	}
+
 	req := message.Request{
-		ID:      id,
-		Payload: body,
+		ID:       id,
+		Payload:  body,
+		ClientID: uint32(clientID64),
+		Sig:      sig,
 		// Buffered so a commit never blocks on a client that has gone away;
 		// Request.Reply also drops rather than waits.
 		C: make(chan message.RequestReply, 1),

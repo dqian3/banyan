@@ -23,6 +23,10 @@ const (
 	BLS_BLS12381    = "BLS_BLS12381"
 	ECDSA_P256      = "ECDSA_P256"
 	ECDSA_SECp256k1 = "ECDSA_SECp256k1"
+	// ED25519 is what the rest of the evaluation signs client requests with;
+	// see ed25519.go for why matching it matters. Unlike ECDSA_P256 it gives
+	// each identity a distinct key.
+	ED25519 = "ED25519"
 	// NONE signs nothing and verifies everything -- benchmarking only, so the
 	// signature cost can be measured by its absence. See none.go.
 	NONE = "NONE"
@@ -93,6 +97,8 @@ func GenerateKey(signer string, id identity.NodeID) (PrivateKey, error) {
 		return nil, nil
 	} else if signer == BLS_BLS12381 {
 		return nil, nil
+	} else if signer == ED25519 {
+		return newEd25519Key("node", uint32(id.Node())), nil
 	} else if signer == NONE {
 		return &none_PrivateKey{SignAlg: signer}, nil
 	} else {

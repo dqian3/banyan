@@ -101,6 +101,17 @@ func (r *Replica) handleRequest(req message.Request) {
 		req.Reply(message.RequestReply{ID: req.ID, Err: "node is not running the client workload"})
 		return
 	}
+	// Verify before admitting, so an unauthenticated request never reaches the
+	// mempool and can never be proposed. This is the arrival-side half of the
+	// per-request work; the other half is every peer re-verifying it out of the
+	// block that carries it (message.VerifyRequestPayload). Together they cost
+	// n verifies per request across the committee, which is what aspen and
+	// PBFT pay.
+	if !req.Verify() {
+		r.requestsRejected++
+		req.Reply(message.RequestReply{ID: req.ID, Err: "invalid client signature"})
+		return
+	}
 	// Store the addressable copy so the reply channel survives; the mempool
 	// stamps arrival on this same struct.
 	held := &req

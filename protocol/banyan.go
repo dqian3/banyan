@@ -7,6 +7,7 @@ import (
 	"banyan/election"
 	"banyan/local_timeout"
 	"banyan/log"
+	"banyan/message"
 	"banyan/node"
 	"fmt"
 	"math/rand"
@@ -87,6 +88,22 @@ func (banyan *Banyan) ProcessBlock(block *blockchain.Block) error {
 		blockIsVerified, _ := crypto.PubVerify(block.Sig, crypto.IDToByte(block.ID), block.Proposer)
 		if !blockIsVerified {
 			log.Warningf("[%v] received a block with an invalid signature", banyan.ID())
+		}
+		// Check every client request the block carries, not just the
+		// proposer's signature over it. The proposer's signature only says
+		// which node assembled these bytes; it says nothing about whether the
+		// clients named inside actually asked for any of it, and without this
+		// a single Byzantine proposer could put anything it liked into the
+		// committed log. This is what a PBFT backup does with the client
+		// signatures embedded in a PRE-PREPARE.
+		//
+		// Skipped for our own block: those requests were verified on arrival,
+		// so re-checking them here would double the proposer's cost and make
+		// the per-request total n+1 rather than n.
+		if n, err := message.VerifyRequestPayload(block.Payload); err != nil {
+			log.Warningf("[%v] rejecting block %x from %v: %v (%d request(s))",
+				banyan.ID(), block.ID, block.Proposer, err, n)
+			return err
 		}
 	}
 

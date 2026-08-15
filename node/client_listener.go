@@ -100,7 +100,13 @@ func (n *node) serveClientConn(conn net.Conn) {
 			}
 			continue
 		}
-		req := message.Request{ID: wire.ID, Payload: wire.Payload, C: replies}
+		req := message.Request{
+			ID:       wire.ID,
+			Payload:  wire.Payload,
+			ClientID: wire.ClientID,
+			Sig:      wire.Sig,
+			C:        replies,
+		}
 		n.TxChan <- req
 	}
 }

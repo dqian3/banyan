@@ -11,6 +11,7 @@ import (
 
 	"banyan/blockchain"
 	"banyan/config"
+	"banyan/crypto"
 	"banyan/election"
 	"banyan/identity"
 	"banyan/local_timeout"
@@ -64,6 +65,11 @@ type Replica struct {
 	proposeWait       *waitStats
 	commitWait        *waitStats
 	committedRequests int
+	// Requests turned away at arrival for a bad client signature. Reported so
+	// a run that is rejecting everything -- a client and nodes configured with
+	// different signing schemes, say -- says so, rather than looking like a
+	// protocol that delivers nothing.
+	requestsRejected int
 }
 
 // WarmupHeights is how many heights the chain runs before the measurement
@@ -88,6 +94,11 @@ func NewReplica(id identity.NodeID, alg string, isByz bool) *Replica {
 
 	r.oneBlockPayloadBytes = config.GetConfig().PayloadSize
 	r.clientDriven = config.GetConfig().IsClientDriven()
+	// Clients sign with the same scheme the nodes are configured for. They
+	// cannot read it from here -- they run as separate processes and are given
+	// their targets on the command line -- so the harness passes it to both
+	// sides and this is where the node half is set.
+	crypto.SetClientScheme(config.GetConfig().GetSignatureScheme())
 	r.pool = mempool.NewMemPool(config.GetConfig().MemSize)
 	r.pending = newPendingRequests()
 	// Seeded per node so two replicas don't generate identical payloads; the
@@ -214,6 +225,7 @@ func (r *Replica) requestReport() string {
 	response := "committedRequests\n" + strconv.Itoa(r.committedRequests) + "\n"
 	response += "requestsReceived\n" + strconv.FormatInt(received, 10) + "\n"
 	response += "requestsDropped\n" + strconv.FormatInt(dropped, 10) + "\n"
+	response += "requestsRejected\n" + strconv.Itoa(r.requestsRejected) + "\n"
 	response += "requestsPending\n" + strconv.Itoa(r.pending.size()) + "\n"
 	response += "mempoolDepth\n" + strconv.Itoa(r.pool.Size()) + "\n"
 	response += section("proposeWait", r.proposeWait)

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"banyan/crypto"
 	"banyan/message"
 )
 
@@ -57,13 +58,18 @@ func dialPipelined(target string, onReply func(string, time.Duration, bool)) (*p
 	return p, nil
 }
 
-func (p *pipelinedConn) send(id string, payload []byte) error {
+func (p *pipelinedConn) send(id string, payload []byte, clientID uint32, sig crypto.Signature) error {
 	p.mu.Lock()
 	p.pending[id] = time.Now()
 	p.mu.Unlock()
 
 	p.sendMu.Lock()
-	err := p.enc.Encode(&message.ClientRequest{ID: id, Payload: payload})
+	err := p.enc.Encode(&message.ClientRequest{
+		ID:       id,
+		Payload:  payload,
+		ClientID: clientID,
+		Sig:      sig,
+	})
 	p.sendMu.Unlock()
 	if err != nil {
 		p.mu.Lock()
