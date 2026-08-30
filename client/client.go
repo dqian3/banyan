@@ -41,10 +41,10 @@ import (
 )
 
 var (
-	rate      = flag.Float64("rate", 1000, "target send rate for this client process, requests/sec (0 = as fast as in-flight allows)")
+	rate      = flag.Float64("rate", 1000, "target send rate for this client process, requests/sec (0 = as fast as in-flight allows; needs -in-flight > 0)")
 	size      = flag.Int("size", 1024, "request payload size in bytes")
 	duration  = flag.Int("duration", 30, "how long to send for, seconds")
-	inFlight  = flag.Int("in-flight", 1000, "max outstanding requests")
+	inFlight  = flag.Int("in-flight", 1000, "max outstanding requests (0 = no cap)")
 	timeoutMs = flag.Int("timeout", 30000, "per-request timeout, milliseconds")
 	warmup    = flag.Int("warmup", 3, "seconds to send before starting measurement")
 	outPath   = flag.String("out", "", "write the JSON summary here as well as stdout")
@@ -128,9 +128,16 @@ func main() {
 	// the queue: without raising these, Go's default of 2 idle conns per host
 	// serializes requests and the "rate" we report is the transport's, not
 	// the protocol's. Only used by the http transport.
+	// 0 means unlimited to MaxIdleConns but "use the default of 2" to
+	// MaxIdleConnsPerHost, so an uncapped client needs a concrete number here
+	// or the pool becomes the bottleneck it is sized to avoid.
+	idlePerHost := *inFlight
+	if idlePerHost <= 0 {
+		idlePerHost = 4096
+	}
 	httpTransport := &http.Transport{
-		MaxIdleConns:        *inFlight * 2,
-		MaxIdleConnsPerHost: *inFlight,
+		MaxIdleConns:        idlePerHost * 2,
+		MaxIdleConnsPerHost: idlePerHost,
 		MaxConnsPerHost:     0,
 		IdleConnTimeout:     90 * time.Second,
 	}
@@ -162,7 +169,14 @@ func main() {
 		samples   []sample
 	)
 
-	sem := make(chan struct{}, *inFlight)
+	// A nil semaphore is the uncapped case: the acquire and release below are
+	// skipped, so the offered rate is the pacer's alone and cap_wait_frac stays
+	// zero. Outstanding requests are then bounded only by rate x -timeout,
+	// which the expiry sweeper enforces.
+	var sem chan struct{}
+	if *inFlight > 0 {
+		sem = make(chan struct{}, *inFlight)
+	}
 	timeout := time.Duration(*timeoutMs) * time.Millisecond
 
 	measureStart := time.Time{}
@@ -173,10 +187,13 @@ func main() {
 	var capWait time.Duration
 
 	// record is called once per request, from whichever path resolved it.
-	// It releases the in-flight slot, so a reply (or an expiry) is what admits
-	// the next request — that is the closed-loop part of the load model.
+	// When there is a cap it releases the in-flight slot, so a reply (or an
+	// expiry) is what admits the next request — that is the closed-loop part
+	// of the load model. Uncapped, the pacer alone sets the offered rate.
 	record := func(id string, latency time.Duration, outcome int) {
-		<-sem
+		if sem != nil {
+			<-sem
+		}
 		switch outcome {
 		case outcomeOK:
 			atomic.AddInt64(&committed, 1)
@@ -272,12 +289,14 @@ loop:
 		// is exactly the event that turns the offered rate into a function of
 		// the in-flight cap, and the accumulated total says how much of the
 		// window was spent that way.
-		if measuring {
-			blocked := time.Now()
-			sem <- struct{}{}
-			capWait += time.Since(blocked)
-		} else {
-			sem <- struct{}{}
+		if sem != nil {
+			if measuring {
+				blocked := time.Now()
+				sem <- struct{}{}
+				capWait += time.Since(blocked)
+			} else {
+				sem <- struct{}{}
+			}
 		}
 		seq++
 		id := fmt.Sprintf("%d-%d", os.Getpid(), seq)
