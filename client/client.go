@@ -46,7 +46,8 @@ var (
 	duration  = flag.Int("duration", 30, "how long to send for, seconds")
 	inFlight  = flag.Int("in-flight", 1000, "max outstanding requests (0 = no cap)")
 	timeoutMs = flag.Int("timeout", 30000, "per-request timeout, milliseconds")
-	warmup    = flag.Int("warmup", 3, "seconds to send before starting measurement")
+	warmup    = flag.Int("warmup", 5, "seconds to send before starting measurement")
+	trail     = flag.Int("trail", 5, "seconds to stop measuring before the send period ends")
 	outPath   = flag.String("out", "", "write the JSON summary here as well as stdout")
 	targets   = flag.String("targets", "", "comma-separated http addresses to send to (default: every node in the config)")
 	// Not "transport": banyan's own transport package already registers a flag
@@ -250,8 +251,16 @@ func main() {
 	}
 
 	var wg sync.WaitGroup // http path only
+	sendStart := time.Now()
 	stop := time.After(time.Duration(*warmup+*duration) * time.Second)
-	measureFrom := time.Now().Add(time.Duration(*warmup) * time.Second)
+	measureFrom := sendStart.Add(time.Duration(*warmup) * time.Second)
+	// The tail of the send period is the loop winding down, the same way the
+	// head is it ramping up, and neither is the steady state the rates are
+	// meant to describe. Trimming both ends matches what the aspen analyzer
+	// does for every other protocol, so the numbers are comparable.
+	measureUntil := sendStart.Add(
+		time.Duration(*warmup+*duration-*trail) * time.Second)
+	measureEnd := time.Time{}
 
 	// Ticker-free pacing: a fixed inter-request interval with a deadline that
 	// advances by exactly that interval keeps the long-run rate on target
@@ -279,12 +288,17 @@ loop:
 			next = next.Add(interval)
 		}
 
-		if measureStart.IsZero() && !time.Now().Before(measureFrom) {
-			measureStart = time.Now()
+		now := time.Now()
+		if measureStart.IsZero() && !now.Before(measureFrom) {
+			measureStart = now
 			measuredSent = 0
 		}
+		if measureEnd.IsZero() && !measureStart.IsZero() &&
+			!now.Before(measureUntil) {
+			measureEnd = now
+		}
 
-		measuring := !measureStart.IsZero()
+		measuring := !measureStart.IsZero() && measureEnd.IsZero()
 		// Time the acquire rather than sampling the queue depth: blocking here
 		// is exactly the event that turns the offered rate into a function of
 		// the in-flight cap, and the accumulated total says how much of the
@@ -377,7 +391,14 @@ loop:
 		wg.Wait()
 	}
 
-	elapsed := time.Since(measureStart).Seconds()
+	// The window itself, not the time to this point. Replies keep landing
+	// after the send loop stops, so measuring to here divided window work by
+	// a window-plus-drain span and deflated every rate below by however long
+	// the drain took.
+	if measureEnd.IsZero() {
+		measureEnd = time.Now()
+	}
+	elapsed := measureEnd.Sub(measureStart).Seconds()
 	if measureStart.IsZero() || elapsed <= 0 {
 		elapsed = float64(*duration)
 	}
