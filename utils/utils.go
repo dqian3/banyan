@@ -60,6 +60,9 @@ func VMax(v ...int) int {
 }
 
 // Retry function f sleep time between attempts
+// maxRetryDelay caps Retry's per-attempt backoff.
+const maxRetryDelay = 500 * time.Millisecond
+
 func Retry(f func() error, attempts int, sleep time.Duration) error {
 	var err error
 	for i := 0; ; i++ {
@@ -72,8 +75,14 @@ func Retry(f func() error, attempts int, sleep time.Duration) error {
 			break
 		}
 
-		// exponential delay
-		time.Sleep(sleep * time.Duration(i+1))
+		// Linear growth, capped. Uncapped, `sleep * (i+1)` over 100 attempts
+		// at 50ms is a 247-second budget -- which read like five seconds at
+		// the call site and was longer than anything waiting on it.
+		delay := sleep * time.Duration(i+1)
+		if delay > maxRetryDelay {
+			delay = maxRetryDelay
+		}
+		time.Sleep(delay)
 	}
 	return fmt.Errorf("after %d attempts, last error: %s", attempts, err)
 }

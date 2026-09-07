@@ -109,7 +109,10 @@ func NewReplica(id identity.NodeID, alg string, isByz bool) *Replica {
 	r.isByz = isByz
 	r.strategy = config.GetConfig().Strategy
 	r.lt = local_timeout.NewLocalTimeout()
-	r.start = make(chan bool)
+	// Buffered: the one receiver is ListenLocalEvent, which Start()
+	// launches and which may not have reached `<-r.start` when the
+	// first event arrives. A slot means the signal never blocks.
+	r.start = make(chan bool, 1)
 	r.eventChan = make(chan interface{}, 100)
 	r.committedBlocks = make(chan *blockchain.Block, 100)
 	r.forkedBlocks = make(chan *blockchain.Block, 100)
@@ -375,9 +378,18 @@ func (r *Replica) ListenCommittedBlocks() {
 }
 
 func (r *Replica) startSignal() {
-	if !r.isStarted.Load() {
+	// CompareAndSwap, not Load-then-Store: startSignal is called from two
+	// goroutines that both see the first event of a run -- the node's TxChan
+	// worker (handleQuery for the harness's kickoff poke, handleRequest for
+	// the first client request) and the replica's own event loop. Loading and
+	// storing separately lets both observe false, and then both send on
+	// `start`, which has exactly one receiver in ListenLocalEvent. The second
+	// send blocks forever. When the loser is the event loop the node stays
+	// alive and keeps answering /query -- handleQuery reads committedBlockNo
+	// without going through the loop -- so it reports "Committed blocks: 0"
+	// for as long as the harness cares to poll, while proposing nothing.
+	if r.isStarted.CAS(false, true) {
 		log.Debugf("[%v] is boosting", r.ID())
-		r.isStarted.Store(true)
 		r.start <- true
 	}
 }
