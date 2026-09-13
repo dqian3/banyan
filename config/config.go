@@ -46,7 +46,11 @@ type Config struct {
 	// requests and tells the client, rather than absorbing unbounded backlog
 	// and reporting it as latency.
 	MemSize int `json:"mem_size"`
-	F       int `json:"f"`
+	// ClientReplyCount is how many nodes reply per committed request: the
+	// block's proposer, which received it, and the nodes after it in node
+	// order. 0 means f+1.
+	ClientReplyCount int `json:"client_reply_count"`
+	F                int `json:"f"`
 	P       int `json:"p"`
 	N       int // total number of nodes
 
@@ -84,6 +88,18 @@ func GetConfig() Config {
 // IsClientDriven reports whether blocks should carry client requests.
 func (c Config) IsClientDriven() bool {
 	return c.Workload == WorkloadClient
+}
+
+// ReplyCount resolves ClientReplyCount, defaulting to f+1 and capped at n.
+func (c Config) ReplyCount() int {
+	k := c.ClientReplyCount
+	if k <= 0 {
+		k = c.F + 1
+	}
+	if c.N > 0 && k > c.N {
+		k = c.N
+	}
+	return k
 }
 
 // Simulation enable go channel transportation to simulate distributed environment

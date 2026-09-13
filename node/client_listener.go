@@ -86,6 +86,7 @@ func (n *node) serveClientConn(conn net.Conn) {
 
 	clientDriven := config.GetConfig().IsClientDriven()
 	dec := gob.NewDecoder(conn)
+	registered := false
 	for {
 		var wire message.ClientRequest
 		if err := dec.Decode(&wire); err != nil {
@@ -93,6 +94,17 @@ func (n *node) serveClientConn(conn net.Conn) {
 				log.Debugf("client connection closed: %v", err)
 			}
 			return
+		}
+		// An empty id is the client's hello: it names the client on this
+		// connection, so this node can reply for requests another node
+		// received.
+		if wire.ID == "" {
+			if !registered {
+				n.registerClient(wire.ClientID, replies)
+				defer n.unregisterClient(wire.ClientID, replies)
+				registered = true
+			}
+			continue
 		}
 		if !clientDriven {
 			replies <- message.RequestReply{
@@ -108,5 +120,39 @@ func (n *node) serveClientConn(conn net.Conn) {
 			C:        replies,
 		}
 		n.TxChan <- req
+	}
+}
+
+func (n *node) registerClient(id uint32, replies chan message.RequestReply) {
+	n.clientsMu.Lock()
+	n.clients[id] = replies
+	n.clientsMu.Unlock()
+}
+
+// unregisterClient forgets a closed connection, unless the client has already
+// reconnected and registered a newer one.
+func (n *node) unregisterClient(id uint32, replies chan message.RequestReply) {
+	n.clientsMu.Lock()
+	if n.clients[id] == replies {
+		delete(n.clients, id)
+	}
+	n.clientsMu.Unlock()
+}
+
+// ReplyTo queues a reply on a client's connection. It drops the reply when
+// the client has not said hello here or its buffer is full, which the client
+// sees as a timeout.
+func (n *node) ReplyTo(clientID uint32, reply message.RequestReply) bool {
+	n.clientsMu.RLock()
+	replies, ok := n.clients[clientID]
+	n.clientsMu.RUnlock()
+	if !ok {
+		return false
+	}
+	select {
+	case replies <- reply:
+		return true
+	default:
+		return false
 	}
 }

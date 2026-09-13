@@ -4,7 +4,6 @@ import (
 	"encoding/gob"
 	"net"
 	"sync"
-	"time"
 
 	"banyan/crypto"
 	"banyan/message"
@@ -12,8 +11,9 @@ import (
 
 // pipelinedConn is one long-lived connection to a node, carrying many
 // requests. Sends are serialized through a single writer goroutine; replies
-// arrive out of order on a reader goroutine and are matched back to their send
-// time by request id.
+// arrive out of order on a reader goroutine and are matched by request id in
+// a tracker shared by every node's connection, since a request is answered by
+// more than the node it was sent to.
 //
 // This is what keeps connection count proportional to the number of nodes
 // rather than to outstanding requests. With one connection per in-flight
@@ -22,20 +22,18 @@ import (
 // its own transport instead of the protocol.
 type pipelinedConn struct {
 	target string
+	node   int // index into the client's target list
 	conn   net.Conn
 	enc    *gob.Encoder
 	dec    *gob.Decoder
 
 	sendMu sync.Mutex
 
-	mu      sync.Mutex
-	pending map[string]time.Time
-
-	onReply func(id string, latency time.Duration, ok bool)
+	replies *replyTracker
 	closed  chan struct{}
 }
 
-func dialPipelined(target string, onReply func(string, time.Duration, bool)) (*pipelinedConn, error) {
+func dialPipelined(target string, node int, clientID uint32, replies *replyTracker) (*pipelinedConn, error) {
 	conn, err := net.Dial("tcp", target)
 	if err != nil {
 		return nil, err
@@ -47,21 +45,25 @@ func dialPipelined(target string, onReply func(string, time.Duration, bool)) (*p
 	}
 	p := &pipelinedConn{
 		target:  target,
+		node:    node,
 		conn:    conn,
 		enc:     gob.NewEncoder(conn),
 		dec:     gob.NewDecoder(conn),
-		pending: make(map[string]time.Time),
-		onReply: onReply,
+		replies: replies,
 		closed:  make(chan struct{}),
+	}
+	// Hello: a request with no id tells the node which client this connection
+	// belongs to, so it can reply for requests other nodes received.
+	if err := p.enc.Encode(&message.ClientRequest{ClientID: clientID}); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	go p.readLoop()
 	return p, nil
 }
 
 func (p *pipelinedConn) send(id string, payload []byte, clientID uint32, sig crypto.Signature) error {
-	p.mu.Lock()
-	p.pending[id] = time.Now()
-	p.mu.Unlock()
+	p.replies.add(id)
 
 	p.sendMu.Lock()
 	err := p.enc.Encode(&message.ClientRequest{
@@ -72,9 +74,7 @@ func (p *pipelinedConn) send(id string, payload []byte, clientID uint32, sig cry
 	})
 	p.sendMu.Unlock()
 	if err != nil {
-		p.mu.Lock()
-		delete(p.pending, id)
-		p.mu.Unlock()
+		p.replies.drop(id)
 	}
 	return err
 }
@@ -86,38 +86,8 @@ func (p *pipelinedConn) readLoop() {
 			close(p.closed)
 			return
 		}
-		p.mu.Lock()
-		sent, ok := p.pending[reply.ID]
-		if ok {
-			delete(p.pending, reply.ID)
-		}
-		p.mu.Unlock()
-		if !ok {
-			continue // duplicate or already timed out
-		}
-		p.onReply(reply.ID, time.Since(sent), reply.Err == "")
+		p.replies.reply(reply.ID, p.node, reply.Err)
 	}
-}
-
-// expire fails requests older than `timeout`, so a lost reply frees its
-// in-flight slot instead of stalling the client forever. Returns how many.
-func (p *pipelinedConn) expire(timeout time.Duration) int {
-	cutoff := time.Now().Add(-timeout)
-	var stale []string
-	p.mu.Lock()
-	for id, sent := range p.pending {
-		if sent.Before(cutoff) {
-			stale = append(stale, id)
-		}
-	}
-	for _, id := range stale {
-		delete(p.pending, id)
-	}
-	p.mu.Unlock()
-	for _, id := range stale {
-		p.onReply(id, timeout, false)
-	}
-	return len(stale)
 }
 
 func (p *pipelinedConn) close() { _ = p.conn.Close() }

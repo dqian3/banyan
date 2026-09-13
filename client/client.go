@@ -62,6 +62,9 @@ var (
 	// command line and so never reads config.json, which is where the nodes
 	// get theirs; a mismatch shows up as every request failing verification.
 	signer = flag.String("signer", "ECDSA_P256", "signing scheme for client requests: ED25519, ECDSA_P256, or NONE")
+	// Must match the nodes' `client_reply_count`: each committed request is
+	// answered by that many nodes, and waiting for more times out.
+	replies = flag.Int("replies", 1, "distinct nodes that must reply before a request counts as committed (tcp transport)")
 )
 
 type sample struct {
@@ -211,21 +214,33 @@ func main() {
 	}
 
 	var conns []*pipelinedConn
+	var tracker *replyTracker
 	if *clientTransport == "tcp" {
-		onReply := func(id string, latency time.Duration, ok bool) {
+		if len(addrs) > 64 {
+			fmt.Fprintf(os.Stderr, "at most 64 nodes are supported, got %d\n", len(addrs))
+			os.Exit(1)
+		}
+		need := *replies
+		if need < 1 {
+			need = 1
+		}
+		if need > len(addrs) {
+			need = len(addrs)
+		}
+		tracker = newReplyTracker(need, func(id string, latency time.Duration, ok bool) {
 			outcome := outcomeFailed
 			if ok {
 				outcome = outcomeOK
 			}
 			record(id, latency, outcome)
-		}
-		for _, addr := range addrs {
+		})
+		for i, addr := range addrs {
 			target, err := clientAddr(addr)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "bad target %q: %v\n", addr, err)
 				os.Exit(1)
 			}
-			conn, err := dialPipelined(target, onReply)
+			conn, err := dialPipelined(target, i, cid, tracker)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "dial %s: %v\n", target, err)
 				os.Exit(1)
@@ -233,18 +248,16 @@ func main() {
 			conns = append(conns, conn)
 		}
 		// Reclaim slots held by requests whose replies never arrive, so one
-		// lost reply cannot wedge the whole client behind the in-flight cap.
+		// lost reply cannot stall the whole client behind the in-flight cap.
 		go func() {
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				for _, c := range conns {
-					for i := 0; i < c.expire(timeout); i++ {
-						// expire() already reported each id through onReply as
-						// a failure; count them as timeouts instead.
-						atomic.AddInt64(&failed, -1)
-						atomic.AddInt64(&timedOut, 1)
-					}
+				for i := 0; i < tracker.expire(timeout); i++ {
+					// expire() already reported each id as a failure; count
+					// them as timeouts instead.
+					atomic.AddInt64(&failed, -1)
+					atomic.AddInt64(&timedOut, 1)
 				}
 			}
 		}()
@@ -367,20 +380,12 @@ loop:
 		// the requests that queued longest — would be missing from the sample.
 		drainUntil := time.Now().Add(timeout + 5*time.Second)
 		for time.Now().Before(drainUntil) {
-			outstanding := 0
-			for _, c := range conns {
-				c.mu.Lock()
-				outstanding += len(c.pending)
-				c.mu.Unlock()
-			}
-			if outstanding == 0 {
+			if tracker.size() == 0 {
 				break
 			}
-			for _, c := range conns {
-				for i := 0; i < c.expire(timeout); i++ {
-					atomic.AddInt64(&failed, -1)
-					atomic.AddInt64(&timedOut, 1)
-				}
+			for i := 0; i < tracker.expire(timeout); i++ {
+				atomic.AddInt64(&failed, -1)
+				atomic.AddInt64(&timedOut, 1)
 			}
 			time.Sleep(200 * time.Millisecond)
 		}

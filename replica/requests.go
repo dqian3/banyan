@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"banyan/config"
+	"banyan/identity"
 	"banyan/log"
 	"banyan/message"
 )
@@ -162,9 +164,12 @@ func (r *Replica) buildPayload() []byte {
 // answerCommitted replies to the clients whose requests are in a committed
 // block, and records how long each waited end to end on this node.
 //
-// Every node runs this, but only the one that received a given request has
-// its reply channel, so exactly one reply per request goes out.
-func (r *Replica) answerCommitted(payload []byte) int {
+// The repliers for a block are its proposer and the next ReplyCount-1 nodes in
+// node order. The proposer received every request in the block and answers on
+// the request's own reply channel; the others answer on the client's
+// connection to them. The client counts a request committed once ReplyCount
+// distinct nodes have replied.
+func (r *Replica) answerCommitted(payload []byte, proposer identity.NodeID) int {
 	reqs, err := message.DecodeRequests(payload)
 	if err != nil || len(reqs) == 0 {
 		// Not request-encoded (generated workload, or an empty block).
@@ -172,15 +177,26 @@ func (r *Replica) answerCommitted(payload []byte) int {
 	}
 	now := time.Now()
 	inWindow := r.inMeasurementWindow()
+	replier := r.repliesFor(proposer)
 	for _, req := range reqs {
 		held, mine := r.pending.take(req.ID)
-		if !mine {
+		if mine {
+			if inWindow {
+				r.commitWait.add(now.Sub(held.Arrival))
+			}
+			held.Reply(message.RequestReply{ID: req.ID})
 			continue
 		}
-		if inWindow {
-			r.commitWait.add(now.Sub(held.Arrival))
+		if replier {
+			r.ReplyTo(req.ClientID, message.RequestReply{ID: req.ID})
 		}
-		held.Reply(message.RequestReply{ID: req.ID})
 	}
 	return len(reqs)
+}
+
+// repliesFor reports whether this node replies for blocks from proposer.
+func (r *Replica) repliesFor(proposer identity.NodeID) bool {
+	cfg := config.GetConfig()
+	offset := (r.ID().Node() - proposer.Node() + cfg.N) % cfg.N
+	return offset < cfg.ReplyCount()
 }

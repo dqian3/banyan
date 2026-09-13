@@ -8,6 +8,7 @@ import (
 	"banyan/config"
 	"banyan/identity"
 	"banyan/log"
+	"banyan/message"
 	"banyan/socket"
 )
 
@@ -20,6 +21,8 @@ type Node interface {
 	Run()
 	Register(m interface{}, f interface{})
 	IsByz() bool
+	// ReplyTo answers a client over its own connection to this node.
+	ReplyTo(clientID uint32, reply message.RequestReply) bool
 }
 
 // node implements Node interface
@@ -34,6 +37,11 @@ type node struct {
 	server      *http.Server
 	isByz       bool
 
+	// Reply channel of each client connected over the pipelined transport,
+	// keyed by client id.
+	clientsMu sync.RWMutex
+	clients   map[uint32]chan message.RequestReply
+
 	sync.RWMutex
 }
 
@@ -47,6 +55,7 @@ func NewNode(id identity.NodeID, isByz bool) Node {
 		MessageChan: make(chan interface{}, 1024),
 		TxChan:      make(chan interface{}, 1024),
 		handles:     make(map[string]reflect.Value),
+		clients:     make(map[uint32]chan message.RequestReply),
 	}
 }
 

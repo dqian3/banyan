@@ -279,7 +279,7 @@ func (r *Replica) processCommittedBlock(block *blockchain.Block) {
 		// wave of timeouts in the client's tail latency at the end of every
 		// run.
 		if r.clientDriven {
-			r.answerCommitted(block.Payload)
+			r.answerCommitted(block.Payload, block.Proposer)
 		}
 		return
 	}
@@ -296,7 +296,7 @@ func (r *Replica) processCommittedBlock(block *blockchain.Block) {
 	r.committedBlockNo++
 	r.lastBlockProposeTime = proposeTime
 	if r.clientDriven {
-		r.committedRequests += r.answerCommitted(block.Payload)
+		r.committedRequests += r.answerCommitted(block.Payload, block.Proposer)
 	}
 
 	log.Infof("[%v] the block is committed, height: %v, id: %x", r.ID(), block.Height, block.ID)
